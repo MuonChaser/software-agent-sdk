@@ -1359,6 +1359,7 @@ class EventService:
             stream_callbacks=[_publish_stream_progress],
             max_iteration_per_run=self.stored.max_iterations,
             stuck_detection=self.stored.stuck_detection,
+            stuck_detection_thresholds=self.stored.stuck_detection_thresholds,
             visualizer=None,
             secrets=self.stored.secrets,
             cipher=self.cipher,
