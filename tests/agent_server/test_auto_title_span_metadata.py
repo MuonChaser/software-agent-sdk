@@ -10,11 +10,13 @@ import subprocess
 import sys
 from typing import Any
 
+import pytest
+
 
 OPERATION_ATTRIBUTE = "lmnr.association.properties.metadata.openhands.operation"
 
 
-def _probe_auto_title_spans() -> dict[str, Any]:
+def _probe_auto_title_spans(profile_fails: bool = False) -> dict[str, Any]:
     """Drive AutoTitleSubscriber through a real Laminar tracer; return its spans."""
     os.environ["LMNR_PROJECT_API_KEY"] = "test-key"
 
@@ -23,6 +25,7 @@ def _probe_auto_title_spans() -> dict[str, Any]:
     from uuid import uuid4
 
     import litellm
+    from litellm.exceptions import AuthenticationError
     from lmnr import Instruments, Laminar
     from lmnr.opentelemetry_lib.tracing import TracerWrapper
     from lmnr.opentelemetry_lib.tracing.processor import LaminarSpanProcessor
@@ -58,7 +61,16 @@ def _probe_auto_title_spans() -> dict[str, Any]:
 
     instrumented_completion = litellm.completion
 
+    calls = []
+
     def mocked_completion(**kwargs: Any):
+        calls.append(kwargs["model"])
+        if kwargs["model"] == "gpt-4o-mini":
+            raise AuthenticationError(
+                "Invalid proxy server token passed",
+                model=kwargs["model"],
+                llm_provider="openai",
+            )
         return instrumented_completion(**{**kwargs, "mock_response": "Fix Auth Bug"})
 
     llm = LLM(usage_id="probe-llm", model="gpt-4o", api_key=SecretStr("test-key"))
@@ -98,8 +110,20 @@ def _probe_auto_title_spans() -> dict[str, Any]:
     )
 
     async def drive() -> None:
-        with patch(
-            "openhands.sdk.llm.llm.litellm_completion", side_effect=mocked_completion
+        with (
+            patch(
+                "openhands.sdk.llm.llm.litellm_completion",
+                side_effect=mocked_completion,
+            ),
+            patch.object(
+                AutoTitleSubscriber,
+                "_load_title_llm",
+                return_value=LLM(
+                    model="gpt-4o-mini", api_key=SecretStr("profile-key"), num_retries=0
+                )
+                if profile_fails
+                else None,
+            ),
         ):
             await AutoTitleSubscriber(service=service)(event)
             for _ in range(250):
@@ -118,6 +142,7 @@ def _probe_auto_title_spans() -> dict[str, Any]:
     }
     return {
         "title": service.stored.title,
+        "calls": calls,
         "conversation_trace_id": root_span.span.get_span_context().trace_id,
         "spans": [
             {
@@ -131,11 +156,12 @@ def _probe_auto_title_spans() -> dict[str, Any]:
     }
 
 
-def test_auto_title_llm_span_joins_the_conversation_trace() -> None:
+@pytest.mark.parametrize("profile_fails", [False, True])
+def test_auto_title_llm_span_joins_the_conversation_trace(profile_fails: bool) -> None:
     # Subprocess: Laminar.initialize() flips process-global tracing on for good,
     # which would change every later test in this worker.
     result = subprocess.run(
-        [sys.executable, __file__],
+        [sys.executable, __file__, *(["--fallback"] if profile_fails else [])],
         capture_output=True,
         text=True,
         timeout=600,
@@ -144,6 +170,9 @@ def test_auto_title_llm_span_joins_the_conversation_trace() -> None:
     probe = json.loads(result.stdout.splitlines()[-1])
 
     assert probe["title"] == "Fix Auth Bug"
+    assert probe["calls"] == (
+        ["gpt-4o-mini", "gpt-4o"] if profile_fails else ["gpt-4o"]
+    )
 
     llm_spans = [
         span for span in probe["spans"] if span["name"] == "litellm.completion"
@@ -166,4 +195,4 @@ def test_auto_title_llm_span_joins_the_conversation_trace() -> None:
 
 
 if __name__ == "__main__":
-    print(json.dumps(_probe_auto_title_spans()))
+    print(json.dumps(_probe_auto_title_spans("--fallback" in sys.argv)))

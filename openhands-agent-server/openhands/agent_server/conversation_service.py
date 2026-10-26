@@ -73,6 +73,7 @@ from openhands.sdk.conversation.state import (
 from openhands.sdk.conversation.title_utils import (
     extract_message_text,
     generate_title_from_message,
+    generate_title_with_llm,
 )
 from openhands.sdk.credential import (
     CredentialAuthorizationRejected,
@@ -81,6 +82,7 @@ from openhands.sdk.credential import (
 )
 from openhands.sdk.event import MessageEvent
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
+from openhands.sdk.event.error_classification import ErrorClassification, FailureKind
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.utils import run_git_command, validate_git_repository
 from openhands.sdk.launch import LaunchedAgent, finalize
@@ -2662,7 +2664,7 @@ class _EventSubscriber(Subscriber):
 
 @observe(
     name="conversation.generate_title",
-    ignore_inputs=["conversation", "llm", "on_error"],
+    ignore_inputs=["conversation", "llm", "on_error", "fallback_llm"],
     metadata={OPERATION_METADATA_KEY: "title_generation"},
 )
 def _generate_title_traced(
@@ -2674,10 +2676,29 @@ def _generate_title_traced(
     max_length: int,
     on_error: Callable[[Exception], None] | None = None,
     prompt: str | None = None,
+    fallback_llm: LLM | None = None,
 ) -> str:
     call_context = (
         conversation.get_llm_call_context() if conversation else LLMCallContext()
     )
+    if fallback_llm is not None:
+        assert llm is not None
+        errors: list[Exception] = []
+        for candidate in (llm, fallback_llm):
+            title = generate_title_with_llm(
+                message,
+                candidate,
+                max_length,
+                call_context=call_context,
+                on_error=errors.append,
+                prompt=prompt,
+            )
+            if title:
+                return title
+        if errors and on_error is not None:
+            on_error(errors[-1])
+        llm = None
+
     return generate_title_from_message(
         message,
         llm,
@@ -2712,13 +2733,25 @@ class AutoTitleSubscriber(Subscriber):
         # don't configure title_llm_profile.
         conversation = self.service._conversation
         title_llm = self._load_title_llm()
+        agent_llm = conversation.agent.llm if conversation else None
+        fallback_llm = None
         if title_llm is None:
-            title_llm = conversation.agent.llm if conversation else None
+            title_llm = agent_llm
+        elif (
+            title_llm.usage_id != "acp-managed"
+            and agent_llm is not None
+            and agent_llm.usage_id != "acp-managed"
+        ):
+            fallback_llm = agent_llm
 
-        # Surface an LLM failure during auto-titling to the UI (issue #16686);
-        # generation itself stays non-fatal and falls back to truncation.
         def _on_title_error(exc: Exception) -> None:
-            self.service._publish_error_event_sync(exc)
+            self.service._publish_error_event_sync(
+                exc,
+                code="TitleGenerationError",
+                classification=ErrorClassification(
+                    kind=FailureKind.UNKNOWN, retryable=False, user_action="none"
+                ),
+            )
 
         async def _generate_and_save() -> None:
             try:
@@ -2732,6 +2765,7 @@ class AutoTitleSubscriber(Subscriber):
                     50,
                     _on_title_error,
                     self.service.stored.prompt,
+                    fallback_llm,
                 )
                 if title and self.service.stored.title is None:
                     await self.service.save_meta(

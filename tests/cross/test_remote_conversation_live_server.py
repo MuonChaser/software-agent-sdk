@@ -25,6 +25,7 @@ import pytest
 import uvicorn
 from fastapi import WebSocket
 from filelock import FileLock
+from litellm.exceptions import AuthenticationError
 from litellm.types.utils import Choices, Message as LiteLLMMessage, ModelResponse
 from openai.types.responses import ResponseInputItemParam
 from pydantic import SecretStr
@@ -33,6 +34,7 @@ from websockets.sync.client import connect
 
 from openhands.agent_server.__main__ import preload_modules
 from openhands.agent_server.config import load_config
+from openhands.agent_server.persistence.store import get_llm_profile_store
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, Message, TextContent
 from openhands.sdk.conversation import RemoteConversation
 from openhands.sdk.event import (
@@ -3168,3 +3170,94 @@ def test_profile_store_consumers_keep_live_server_responsive(
     finally:
         safety.cancel()
         held.release(force=True)
+
+
+@pytest.mark.parametrize("agent_fails", [False, True])
+def test_auto_title_profile_failure_over_real_server(server_env, agent_fails):
+    get_llm_profile_store().save(
+        "title-profile",
+        LLM(
+            model="openai/gpt-4o-mini", api_key=SecretStr("profile-key"), num_retries=0
+        ),
+        include_secrets=True,
+    )
+    calls = []
+
+    def completion(**kwargs):
+        name = "profile" if kwargs["api_key"] == "profile-key" else "agent"
+        calls.append(name)
+        if name == "profile" or agent_fails:
+            raise AuthenticationError(
+                "Invalid proxy server token passed",
+                model=kwargs["model"],
+                llm_provider="openai",
+            )
+        return ModelResponse(
+            model=kwargs["model"],
+            choices=[
+                Choices(
+                    index=0,
+                    finish_reason="stop",
+                    message=LiteLLMMessage(
+                        role="assistant", content="Agent-generated title"
+                    ),
+                )
+            ],
+        )
+
+    with (
+        patch("openhands.sdk.llm.llm.litellm_completion", side_effect=completion),
+        httpx.Client(base_url=server_env["host"], timeout=10) as client,
+    ):
+        response = client.post(
+            "/api/conversations",
+            json={
+                "agent": {
+                    "llm": {
+                        "model": "openai/gpt-4o",
+                        "api_key": "agent-key",
+                        "num_retries": 0,
+                    },
+                    "tools": [],
+                },
+                "workspace": {"working_dir": str(server_env["workspace_path"])},
+                "title_llm_profile": "title-profile",
+            },
+        )
+        response.raise_for_status()
+        cid = response.json()["id"]
+        response = client.post(
+            f"/api/conversations/{cid}/events",
+            json={
+                "role": "user",
+                "content": [{"type": "text", "text": "Fix login"}],
+                "run": False,
+            },
+        )
+        response.raise_for_status()
+        deadline = time.monotonic() + 10
+        info = client.get(f"/api/conversations/{cid}").json()
+        while time.monotonic() < deadline:
+            info = client.get(f"/api/conversations/{cid}").json()
+            if info["title"] is not None:
+                break
+            time.sleep(0.02)
+        assert info["title"] == (
+            "Fix login" if agent_fails else "Agent-generated title"
+        )
+        assert info["execution_status"] != "error"
+        response = client.get(f"/api/conversations/{cid}/events/search")
+        response.raise_for_status()
+        errors = [
+            e for e in response.json()["items"] if e["kind"] == "ConversationErrorEvent"
+        ]
+        assert len(errors) == int(agent_fails)
+        if errors:
+            assert errors[0]["code"] == "TitleGenerationError"
+            assert errors[0]["classification"] == {
+                "kind": "unknown",
+                "retryable": False,
+                "user_action": "none",
+            }
+        assert calls == ["profile", "agent"]
+        client.delete(f"/api/conversations/{cid}").raise_for_status()

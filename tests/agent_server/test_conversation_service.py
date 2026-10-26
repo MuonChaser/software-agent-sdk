@@ -3654,7 +3654,8 @@ class TestAutoTitle:
                 "openhands.agent_server.persistence.store.get_llm_profile_store"
             ) as MockStore,
             patch(
-                self._GENERATE_TITLE_PATH, return_value="✨ Profile LLM Title"
+                "openhands.agent_server.conversation_service.generate_title_with_llm",
+                return_value="✨ Profile LLM Title",
             ) as mock_generate_title,
         ):
             mock_store_instance = MockStore.return_value
