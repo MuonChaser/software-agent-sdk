@@ -15,6 +15,7 @@ import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -35,6 +36,7 @@ from openhands.agent_server.__main__ import preload_modules
 from openhands.agent_server.config import load_config
 from openhands.sdk import LLM, Agent, AgentContext, Conversation, Message, TextContent
 from openhands.sdk.conversation import RemoteConversation
+from openhands.sdk.conversation.event_store import EventLog
 from openhands.sdk.event import (
     ActionEvent,
     AgentErrorEvent,
@@ -46,11 +48,15 @@ from openhands.sdk.event import (
     MessageEvent,
     ObservationEvent,
     PauseEvent,
+    SecurityAnalysisEvent,
     SystemPromptEvent,
 )
 from openhands.sdk.git.exceptions import GitCommandError
 from openhands.sdk.git.utils import run_git_command
 from openhands.sdk.hooks import HookConfig, HookDefinition, HookMatcher
+from openhands.sdk.io.local import LocalFileStore
+from openhands.sdk.llm import MessageToolCall
+from openhands.sdk.security.llm_analyzer import LLMSecurityAnalyzer
 from openhands.sdk.skills import Skill
 from openhands.sdk.subagent import AgentDefinition
 from openhands.sdk.subagent.registry import (
@@ -60,9 +66,12 @@ from openhands.sdk.subagent.registry import (
     register_agent,
     register_agent_if_absent,
 )
+from openhands.sdk.testing import TestLLM
+from openhands.sdk.tool import Tool
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
 from openhands.sdk.workspace import RemoteWorkspace
+from openhands.tools.file_editor import FileEditorTool
 from openhands.workspace.docker.workspace import find_available_tcp_port
 
 
@@ -903,6 +912,7 @@ def test_remote_conversation_over_real_server(server_env, patched_llm):
                     Event,
                     LLMConvertibleEvent,
                     SystemPromptEvent,
+                    SecurityAnalysisEvent,
                     PauseEvent,
                     CondensationSummaryEvent,
                     ConversationStateUpdateEvent,
@@ -966,6 +976,7 @@ def test_remote_conversation_over_real_server(server_env, patched_llm):
                             MessageEvent,
                             ActionEvent,
                             SystemPromptEvent,
+                            SecurityAnalysisEvent,
                             ConversationStateUpdateEvent,
                         ),
                     )
@@ -3168,3 +3179,107 @@ def test_profile_store_consumers_keep_live_server_responsive(
     finally:
         safety.cancel()
         held.release(force=True)
+
+
+def test_secret_masked_timestamp_cursor_with_live_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    secret = datetime.now().isoformat()[:4]
+    target = tmp_path / "synthetic.txt"
+    target.write_text(f"synthetic content {secret}")
+    scripted = TestLLM.from_messages(
+        [
+            Message(
+                role="assistant",
+                tool_calls=[
+                    MessageToolCall(
+                        id="call-view",
+                        name=FileEditorTool.name,
+                        arguments=json.dumps({"command": "view", "path": str(target)}),
+                        origin="completion",
+                    )
+                ],
+            ),
+            Message(
+                role="assistant",
+                tool_calls=[
+                    MessageToolCall(
+                        id="call-finish",
+                        name="finish",
+                        arguments='{"message": "done"}',
+                        origin="completion",
+                    )
+                ],
+            ),
+        ],
+        model="gpt-4o-mini",
+    )
+
+    async def acompletion(self, messages, tools=None, **kwargs):
+        return await scripted.acompletion(messages, tools=tools, **kwargs)
+
+    def completion(self, messages, **kwargs):
+        return TestLLM.from_messages(
+            [Message(role="assistant", content=[TextContent(text="Timestamp test")])]
+        ).completion(messages, **kwargs)
+
+    monkeypatch.setattr(LLM, "completion", completion)
+    monkeypatch.setattr(LLM, "acompletion", acompletion)
+    with live_server_env(tmp_path / "server", monkeypatch) as env:
+        workspace = RemoteWorkspace(
+            host=env["host"], working_dir=str(env["workspace_path"])
+        )
+        agent = Agent(
+            llm=LLM(model="gpt-4o-mini", api_key=SecretStr("unused")),
+            tools=[Tool(name=FileEditorTool.name)],
+        )
+        conversation = Conversation(
+            agent=agent,
+            workspace=workspace,
+            visualizer=None,
+            secrets={"DATE": secret},
+            delete_on_close=False,
+        )
+        try:
+            conversation.set_security_analyzer(LLMSecurityAnalyzer())
+            conversation.send_message("Read the synthetic file and finish.")
+            conversation.run()
+            endpoint = f"/api/conversations/{conversation.id}/events/search"
+            with httpx.Client(base_url=env["host"], trust_env=False) as client:
+                response = client.get(endpoint, params={"sort_order": "TIMESTAMP_DESC"})
+                assert response.status_code == 200, response.text
+                items = response.json()["items"]
+                analysis = next(
+                    i for i in items if i["kind"] == "SecurityAnalysisEvent"
+                )
+                cursor = analysis["timestamp"]
+                older = client.get(endpoint, params={"timestamp__lt": cursor})
+                assert older.status_code == 200, older.text
+                newer = client.get(endpoint, params={"timestamp__gte": cursor})
+                assert newer.status_code == 200, newer.text
+                assert older.json()["items"]
+                assert newer.json()["items"]
+                assert all(i["timestamp"] < cursor for i in older.json()["items"])
+                assert all(i["timestamp"] >= cursor for i in newer.json()["items"])
+                assert {i["id"] for i in items} == {
+                    i["id"] for i in older.json()["items"] + newer.json()["items"]
+                }
+                for item in items:
+                    datetime.fromisoformat(item["timestamp"])
+                observations = [i for i in items if i["kind"] == "ObservationEvent"]
+                assert any("<secret-hidden>" in json.dumps(i) for i in observations)
+
+        finally:
+            conversation.close()
+
+        event_paths = list((tmp_path / "server").rglob("events/*.json"))
+        (analysis_path,) = [
+            p for p in event_paths if json.loads(p.read_text())["id"] == analysis["id"]
+        ]
+        stored = json.loads(analysis_path.read_text())
+        assert stored["timestamp"] == cursor
+        assert cursor.startswith(secret)
+        log = EventLog(LocalFileStore(str(analysis_path.parent.parent)))
+        restored = log[log.get_index(analysis["id"])]
+        assert isinstance(restored, SecurityAnalysisEvent)
+        assert restored.timestamp == cursor
