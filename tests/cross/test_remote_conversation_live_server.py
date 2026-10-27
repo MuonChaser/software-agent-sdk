@@ -912,7 +912,6 @@ def test_remote_conversation_over_real_server(server_env, patched_llm):
                     Event,
                     LLMConvertibleEvent,
                     SystemPromptEvent,
-                    SecurityAnalysisEvent,
                     PauseEvent,
                     CondensationSummaryEvent,
                     ConversationStateUpdateEvent,
@@ -976,7 +975,6 @@ def test_remote_conversation_over_real_server(server_env, patched_llm):
                             MessageEvent,
                             ActionEvent,
                             SystemPromptEvent,
-                            SecurityAnalysisEvent,
                             ConversationStateUpdateEvent,
                         ),
                     )
@@ -3184,9 +3182,11 @@ def test_profile_store_consumers_keep_live_server_responsive(
 def test_secret_masked_timestamp_cursor_with_live_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    secret = datetime.now().isoformat()[:4]
+    year = datetime.now().year
+    # Events are stamped in the next year if the test runs across New Year.
+    secrets = {"YEAR": str(year), "NEXT_YEAR": str(year + 1)}
     target = tmp_path / "synthetic.txt"
-    target.write_text(f"synthetic content {secret}")
+    target.write_text(f"synthetic content {year}")
     scripted = TestLLM.from_messages(
         [
             Message(
@@ -3237,7 +3237,7 @@ def test_secret_masked_timestamp_cursor_with_live_server(
             agent=agent,
             workspace=workspace,
             visualizer=None,
-            secrets={"DATE": secret},
+            secrets=secrets,
             delete_on_close=False,
         )
         try:
@@ -3278,7 +3278,7 @@ def test_secret_masked_timestamp_cursor_with_live_server(
         ]
         stored = json.loads(analysis_path.read_text())
         assert stored["timestamp"] == cursor
-        assert cursor.startswith(secret)
+        assert cursor[:4] in secrets.values()
         log = EventLog(LocalFileStore(str(analysis_path.parent.parent)))
         restored = log[log.get_index(analysis["id"])]
         assert isinstance(restored, SecurityAnalysisEvent)
